@@ -49,5 +49,11 @@ async def live_dashboard():
     return FileResponse(WEB_DIR / "index.html")
 
 
+@app.get("/map", include_in_schema=False)
+async def live_map():
+    """Live vessel map dashboard for current API stream."""
+    return FileResponse(WEB_DIR / "map.html")
+
+
 app.include_router(health_router)
 app.include_router(api_router, prefix=settings.API_PREFIX)

@@ -9,18 +9,21 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import AsyncGenerator, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.database import get_db
-from app.db.schemas import Position, StatsOut
+from app.db.models import Vessel
+from app.db.schemas import Position, StatsOut, VesselOut
 from app.services.redis_client import read_stats, subscribe_live
 
 router = APIRouter()
 _UTC = timezone.utc
+_sse_dropped_total: int = 0
 
 
 async def _sse_generator() -> AsyncGenerator[str, None]:
@@ -37,7 +40,8 @@ async def _sse_generator() -> AsyncGenerator[str, None]:
                 try:
                     queue.put_nowait(payload)
                 except asyncio.QueueFull:
-                    pass  # drop if slow client
+                    global _sse_dropped_total
+                    _sse_dropped_total += 1
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -84,10 +88,20 @@ async def live_stream():
 
 @router.get("/stats", response_model=StatsOut)
 async def stats():
-    """Worker stats (from Redis) plus zone config."""
+    """Worker stats (from Redis) plus zone config and API-side counters."""
     data = await read_stats()
     if data is None:
-        data = {"status": "no worker", "received": 0, "stored": 0, "discarded": 0, "vessels": 0, "errors": 0}
+        data = {
+            "status": "no worker",
+            "received": 0,
+            "stored": 0,
+            "discarded": 0,
+            "vessels": 0,
+            "errors": 0,
+            "dropped": 0,
+        }
+    data.setdefault("dropped", 0)
+    data["sse_dropped"] = _sse_dropped_total
     return StatsOut(
         **data,
         zone_name=settings.ZONE_NAME,
@@ -117,3 +131,15 @@ async def recent_positions(
         params = {"since": since, "limit": limit}
     rows = (await db.execute(text(sql), params)).mappings().all()
     return [Position(**dict(r)) for r in rows]
+
+
+@router.get("/vessels/{mmsi}", response_model=VesselOut, summary="Static vessel details by MMSI")
+async def vessel_by_mmsi(
+    mmsi: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch one vessel static/voyage record by MMSI."""
+    vessel = (await db.execute(select(Vessel).where(Vessel.mmsi == mmsi))).scalar_one_or_none()
+    if vessel is None:
+        raise HTTPException(status_code=404, detail="Vessel not found")
+    return VesselOut.model_validate(vessel)

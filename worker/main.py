@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 # Ensure project root is on path when running as worker
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -252,8 +253,24 @@ class IngestionWorker:
             "vessels": 0,
             "errors": 0,
             "dropped": 0,
+            "queue_depth_hwm": 0,
+            "publish_queue_hwm": 0,
+            "last_flush_count": 0,
+            "last_flush_duration_ms": 0,
         }
-        self._msg_queue: asyncio.Queue[str | bytes | None] = asyncio.Queue(maxsize=50_000)
+        self._msg_queue: asyncio.Queue[str | bytes | None] = asyncio.Queue(
+            maxsize=settings.WORKER_MSG_QUEUE_SIZE
+        )
+        self._publish_queue: asyncio.Queue[dict | None] = asyncio.Queue(
+            maxsize=settings.WORKER_PUBLISH_QUEUE_SIZE
+        )
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def _spawn(self, coro: Any, name: str) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def start(self) -> None:
         if not settings.AISSTREAM_API_KEY.strip():
@@ -263,10 +280,11 @@ class IngestionWorker:
             )
             return
         self._running = True
-        asyncio.create_task(self._flush_loop(), name="ais-flush")
-        asyncio.create_task(self._materialise_loop(), name="ais-1min")
-        asyncio.create_task(self._stats_loop(), name="ais-stats")
-        asyncio.create_task(self._connect_loop(), name="ais-ws")
+        self._spawn(self._flush_loop(), "ais-flush")
+        self._spawn(self._publish_loop(), "ais-publish")
+        self._spawn(self._materialise_loop(), "ais-1min")
+        self._spawn(self._stats_loop(), "ais-stats")
+        self._spawn(self._connect_loop(), "ais-ws")
         logger.info(
             "AIS worker started — zone: %s [%.4f,%.4f / %.4f,%.4f]",
             settings.ZONE_NAME,
@@ -278,6 +296,14 @@ class IngestionWorker:
 
     async def stop(self) -> None:
         self._running = False
+        try:
+            self._publish_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        for t in list(self._tasks):
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         await self._flush_all()
         self.stats["status"] = "stopped"
         logger.info("AIS worker stopped")
@@ -285,7 +311,32 @@ class IngestionWorker:
     async def _flush_loop(self) -> None:
         while self._running:
             await asyncio.sleep(settings.BATCH_TIMEOUT_SEC)
-            await self._flush_all()
+            try:
+                t0 = time.perf_counter()
+                await self._flush_all()
+                self.stats["last_flush_duration_ms"] = round(
+                    (time.perf_counter() - t0) * 1000
+                )
+            except Exception as exc:
+                self.stats["errors"] += 1
+                logger.warning("flush error: %s", exc)
+
+    async def _publish_loop(self) -> None:
+        while self._running:
+            try:
+                row = await asyncio.wait_for(
+                    self._publish_queue.get(), timeout=1.0
+                )
+                if row is None:
+                    return
+                await publish_live_position(row)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.stats["errors"] += 1
+                logger.debug("publish error: %s", exc)
 
     async def _materialise_loop(self) -> None:
         while self._running:
@@ -367,6 +418,10 @@ class IngestionWorker:
                         raise AISStreamSubscriptionError(stream_error)
                     try:
                         self._msg_queue.put_nowait(raw)
+                        self.stats["queue_depth_hwm"] = max(
+                            self.stats.get("queue_depth_hwm", 0),
+                            self._msg_queue.qsize(),
+                        )
                     except asyncio.QueueFull:
                         self.stats["dropped"] += 1
             finally:
@@ -392,7 +447,14 @@ class IngestionWorker:
                 return
             self._pos_batch.append(row)
             self.stats["stored"] += 1
-            asyncio.create_task(self._publish_and_maybe_flush(row))
+            try:
+                self._publish_queue.put_nowait(row)
+                self.stats["publish_queue_hwm"] = max(
+                    self.stats.get("publish_queue_hwm", 0),
+                    self._publish_queue.qsize(),
+                )
+            except asyncio.QueueFull:
+                self.stats["dropped"] += 1
         elif "Static" in msg_class or msg_class in (
             "ShipStaticData",
         ):
@@ -400,17 +462,13 @@ class IngestionWorker:
             if row:
                 self._vessel_batch.append(row)
                 self.stats["vessels"] += 1
-                if len(self._vessel_batch) >= settings.BATCH_SIZE:
-                    asyncio.create_task(self._flush_vessels_now())
-
-    async def _publish_and_maybe_flush(self, row: dict) -> None:
-        await publish_live_position(row)
-        if len(self._pos_batch) >= settings.BATCH_SIZE:
-            await self._flush_pos_now()
 
     async def _flush_all(self) -> None:
+        n_pos = len(self._pos_batch)
+        n_vessel = len(self._vessel_batch)
         await self._flush_pos_now()
         await self._flush_vessels_now()
+        self.stats["last_flush_count"] = n_pos + n_vessel
 
     async def _flush_pos_now(self) -> None:
         batch, self._pos_batch = self._pos_batch, []

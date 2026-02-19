@@ -50,7 +50,7 @@
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 900px;
+      min-width: 1500px;
     }
     th, td {
       padding: 10px 12px;
@@ -81,6 +81,7 @@
   <p class="meta">
     Streaming from <code>/api/v1/live</code>
     <span id="conn-status" class="status disconnected">Disconnected</span>
+    · <a href="/map" style="color:#93c5fd;">Map View</a>
   </p>
   <div class="table-wrap">
     <table>
@@ -88,6 +89,13 @@
         <tr>
           <th>Time (UTC)</th>
           <th>MMSI</th>
+          <th>Vessel Name</th>
+          <th>IMO</th>
+          <th>Callsign</th>
+          <th>Ship Type</th>
+          <th>Destination</th>
+          <th>ETA</th>
+          <th>Draught</th>
           <th>Latitude</th>
           <th>Longitude</th>
           <th>Speed</th>
@@ -106,15 +114,24 @@
   <script>
     const maxRows = 100;
     const byMmsi = new Map();
+    const vesselByMmsi = new Map();
+    const vesselFetchInFlight = new Set();
     const rowsEl = document.getElementById("rows");
     const emptyEl = document.getElementById("empty");
     const statusEl = document.getElementById("conn-status");
+
+    const escapeHtml = (value) => String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
 
     const asText = (value) => {
       if (value === null || value === undefined || value === "") {
         return "-";
       }
-      return String(value);
+      return escapeHtml(value);
     };
 
     const fmtNumber = (value, digits = 5) => {
@@ -141,18 +158,30 @@
         .slice(0, maxRows);
 
       rowsEl.innerHTML = rows.map((row) => `
-        <tr>
-          <td>${fmtTime(row.time)}</td>
-          <td>${asText(row.mmsi)}</td>
-          <td>${fmtNumber(row.latitude)}</td>
-          <td>${fmtNumber(row.longitude)}</td>
-          <td>${fmtNumber(row.speed, 2)}</td>
-          <td>${fmtNumber(row.course, 2)}</td>
-          <td>${asText(row.heading)}</td>
-          <td>${asText(row.nav_status)}</td>
-          <td>${fmtNumber(row.rot, 2)}</td>
-          <td>${asText(row.msg_type)}</td>
-        </tr>
+        ${(() => {
+          const vessel = vesselByMmsi.get(String(row.mmsi)) || {};
+          return `
+            <tr>
+              <td>${fmtTime(row.time)}</td>
+              <td>${asText(row.mmsi)}</td>
+              <td>${asText(vessel.name)}</td>
+              <td>${asText(vessel.imo)}</td>
+              <td>${asText(vessel.callsign)}</td>
+              <td>${asText(vessel.ship_type_text || vessel.ship_type)}</td>
+              <td>${asText(vessel.destination)}</td>
+              <td>${asText(vessel.eta)}</td>
+              <td>${fmtNumber(vessel.draught, 2)}</td>
+              <td>${fmtNumber(row.latitude)}</td>
+              <td>${fmtNumber(row.longitude)}</td>
+              <td>${fmtNumber(row.speed, 2)}</td>
+              <td>${fmtNumber(row.course, 2)}</td>
+              <td>${asText(row.heading)}</td>
+              <td>${asText(row.nav_status)}</td>
+              <td>${fmtNumber(row.rot, 2)}</td>
+              <td>${asText(row.msg_type)}</td>
+            </tr>
+          `;
+        })()}
       `).join("");
 
       emptyEl.style.display = rows.length ? "none" : "block";
@@ -172,7 +201,27 @@
       try {
         const data = JSON.parse(event.data);
         if (data && data.mmsi) {
-          byMmsi.set(String(data.mmsi), data);
+          const key = String(data.mmsi);
+          byMmsi.set(key, data);
+          if (!vesselByMmsi.has(key) && !vesselFetchInFlight.has(key)) {
+            vesselFetchInFlight.add(key);
+            fetch(`/api/v1/vessels/${encodeURIComponent(key)}`)
+              .then((res) => (res.ok ? res.json() : null))
+              .then((vessel) => {
+                if (vessel) {
+                  vesselByMmsi.set(key, vessel);
+                } else {
+                  vesselByMmsi.set(key, {});
+                }
+              })
+              .catch(() => {
+                vesselByMmsi.set(key, {});
+              })
+              .finally(() => {
+                vesselFetchInFlight.delete(key);
+                render();
+              });
+          }
           render();
         }
       } catch (_) {

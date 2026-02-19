@@ -3,6 +3,8 @@ CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
 -- ─────────────────────────────────────────────────────────────
 -- 1. positions_1sec  — high-frequency, rolling 24-hour window
+--    PK (time, mmsi) enables ON CONFLICT DO NOTHING for idempotent inserts.
+--    Existing DBs created without PK need a one-off migration to add it (after dedupe).
 -- ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS positions_1sec (
     time        TIMESTAMPTZ     NOT NULL,
@@ -14,7 +16,8 @@ CREATE TABLE IF NOT EXISTS positions_1sec (
     heading     SMALLINT,
     nav_status  SMALLINT,
     rot         REAL,
-    msg_type    SMALLINT
+    msg_type    SMALLINT,
+    PRIMARY KEY (time, mmsi)
 );
 
 SELECT create_hypertable('positions_1sec', 'time',
@@ -49,7 +52,8 @@ CREATE TABLE IF NOT EXISTS positions_1min (
     course      REAL,
     heading     SMALLINT,
     nav_status  SMALLINT,
-    msg_count   SMALLINT
+    msg_count   SMALLINT,
+    PRIMARY KEY (time, mmsi)
 );
 
 SELECT create_hypertable('positions_1min', 'time',

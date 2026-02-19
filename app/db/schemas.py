@@ -1,6 +1,6 @@
 """Phase 1 API response schemas."""
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -33,3 +33,30 @@ class StatsOut(BaseModel):
     dropped: int = 0
     zone_name: str = ""
     bbox: dict[str, float] = {}
+    # Backpressure / observability (additive, optional)
+    queue_depth_hwm: int = 0
+    publish_queue_hwm: int = 0
+    last_flush_count: int = 0
+    last_flush_duration_ms: int = 0
+    sse_dropped: int = 0
+
+
+class VesselOut(BaseModel):
+    """Static vessel and voyage data."""
+    model_config = ConfigDict(from_attributes=True)
+
+    mmsi: int
+    imo: Optional[int] = None
+    callsign: Optional[str] = None
+    name: Optional[str] = None
+    ship_type: Optional[int] = None
+    ship_type_text: Optional[str] = None
+    dim_to_bow: Optional[int] = None
+    dim_to_stern: Optional[int] = None
+    dim_to_port: Optional[int] = None
+    dim_to_starboard: Optional[int] = None
+    draught: Optional[float] = None
+    destination: Optional[str] = None
+    eta: Optional[str] = None
+    first_seen: Optional[datetime] = None
+    last_updated: Optional[datetime] = None

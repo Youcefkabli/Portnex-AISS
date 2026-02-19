@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     # ── Ingestion tuning ──────────────────────────────────────
     BATCH_SIZE: int = 50
     BATCH_TIMEOUT_SEC: float = 1.0
+    WORKER_MSG_QUEUE_SIZE: int = 50_000
+    WORKER_PUBLISH_QUEUE_SIZE: int = 10_000
 
     # ── API ───────────────────────────────────────────────────
     API_PREFIX: str = "/api/v1"

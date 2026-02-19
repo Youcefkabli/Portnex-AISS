@@ -28,6 +28,11 @@ from app.services.redis_client import publish_live_position, write_stats
 
 logger = logging.getLogger("ais.worker")
 
+
+class AISStreamSubscriptionError(Exception):
+    """Raised when AISStream returns a subscription/authentication error."""
+
+
 # ─────────────────────────────────────────────────────────────
 # Ship type helper
 # ─────────────────────────────────────────────────────────────
@@ -68,6 +73,28 @@ def _ts(raw: str | None) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _eta_to_text(raw: Any) -> str | None:
+    """
+    Normalise AIS ETA payload to DB text.
+    AISStream may provide ETA as object: {"Month":..,"Day":..,"Hour":..,"Minute":..}
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        value = raw.strip()
+        return value or None
+    if isinstance(raw, dict):
+        month = int(raw.get("Month", 0) or 0)
+        day = int(raw.get("Day", 0) or 0)
+        hour = int(raw.get("Hour", 0) or 0)
+        minute = int(raw.get("Minute", 0) or 0)
+        # AIS often uses zeroed/unknown ETA fields.
+        if month == 0 and day == 0:
+            return None
+        return f"{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
+    return None
+
+
 def _parse_position(msg: dict[str, Any]) -> dict | None:
     meta = msg.get("MetaData", {})
     payload = msg.get("Message", {})
@@ -104,7 +131,8 @@ def _parse_position(msg: dict[str, Any]) -> dict | None:
         "heading": pos.get("TrueHeading"),
         "nav_status": pos.get("NavigationalStatus"),
         "rot": pos.get("RateOfTurn"),
-        "msg_type": msg.get("MessageType"),
+        # positions_1sec.msg_type is numeric in DB schema; use AIS MessageID.
+        "msg_type": pos.get("MessageID"),
     }
 
 
@@ -132,9 +160,27 @@ def _parse_static(msg: dict[str, Any]) -> dict | None:
         "dim_to_starboard": dim.get("D"),
         "draught": static.get("MaximumStaticDraught"),
         "destination": (static.get("Destination") or "").strip() or None,
-        "eta": static.get("Eta"),
+        "eta": _eta_to_text(static.get("Eta")),
         "last_updated": _ts(meta.get("time_utc")),
     }
+
+
+def _extract_stream_error(raw: str | bytes) -> str | None:
+    """
+    AISStream docs define server-side failures as: {"error": "..."}.
+    Parse and surface these explicitly (e.g., invalid API key/filter type).
+    """
+    try:
+        msg = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(msg, dict):
+        return None
+    err = msg.get("error") or msg.get("Error")
+    if isinstance(err, str):
+        err = err.strip()
+        return err or None
+    return None
 
 
 async def _flush_1sec(batch: list[dict]) -> None:
@@ -205,9 +251,17 @@ class IngestionWorker:
             "discarded": 0,
             "vessels": 0,
             "errors": 0,
+            "dropped": 0,
         }
+        self._msg_queue: asyncio.Queue[str | bytes | None] = asyncio.Queue(maxsize=50_000)
 
     async def start(self) -> None:
+        if not settings.AISSTREAM_API_KEY.strip():
+            self.stats["status"] = "auth error (missing AISSTREAM_API_KEY)"
+            logger.error(
+                "AISSTREAM_API_KEY is empty; set a valid key from https://aisstream.io/apikeys"
+            )
+            return
         self._running = True
         asyncio.create_task(self._flush_loop(), name="ais-flush")
         asyncio.create_task(self._materialise_loop(), name="ais-1min")
@@ -255,6 +309,16 @@ class IngestionWorker:
             try:
                 await self._stream()
                 delay = 1
+            except AISStreamSubscriptionError as exc:
+                self.stats["errors"] += 1
+                self.stats["status"] = f"stream error ({exc})"
+                logger.error(
+                    "AISStream subscription/authentication failed: %s. "
+                    "Check AISSTREAM_API_KEY and FilterMessageTypes.",
+                    exc,
+                )
+                # Avoid aggressive reconnect loops for invalid credentials.
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -266,14 +330,13 @@ class IngestionWorker:
 
     async def _stream(self) -> None:
         sub = {
-            "APIKey": settings.AISSTREAM_API_KEY,
+            "APIKey": settings.AISSTREAM_API_KEY.strip(),
             "BoundingBoxes": settings.bounding_box(),
             "FilterMessageTypes": [
                 "PositionReport",
                 "StandardClassBPositionReport",
                 "ExtendedClassBPositionReport",
                 "ShipStaticData",
-                "ClassBCsStaticDataReport",
             ],
         }
         async with websockets.connect(
@@ -282,16 +345,39 @@ class IngestionWorker:
             await ws.send(json.dumps(sub))
             self.stats["status"] = "streaming"
             logger.info("AISstream connected — zone: %s", settings.ZONE_NAME)
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    self._handle(raw)
-                except Exception as exc:
-                    self.stats["errors"] += 1
-                    logger.debug("Parse error: %s", exc)
 
-    def _handle(self, raw: str) -> None:
+            async def consume():
+                while self._running:
+                    raw = await self._msg_queue.get()
+                    if raw is None:
+                        return
+                    try:
+                        self._handle(raw)
+                    except Exception as exc:
+                        self.stats["errors"] += 1
+                        logger.debug("Parse error: %s", exc)
+
+            consumer = asyncio.create_task(consume())
+            try:
+                async for raw in ws:
+                    if not self._running:
+                        break
+                    stream_error = _extract_stream_error(raw)
+                    if stream_error:
+                        raise AISStreamSubscriptionError(stream_error)
+                    try:
+                        self._msg_queue.put_nowait(raw)
+                    except asyncio.QueueFull:
+                        self.stats["dropped"] += 1
+            finally:
+                try:
+                    self._msg_queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    # Ensure consumer can exit even under sustained high load.
+                    await self._msg_queue.put(None)
+                await consumer
+
+    def _handle(self, raw: str | bytes) -> None:
         msg = json.loads(raw)
         msg_class = msg.get("MessageType", "")
         self.stats["received"] += 1
@@ -309,7 +395,6 @@ class IngestionWorker:
             asyncio.create_task(self._publish_and_maybe_flush(row))
         elif "Static" in msg_class or msg_class in (
             "ShipStaticData",
-            "ClassBCsStaticDataReport",
         ):
             row = _parse_static(msg)
             if row:

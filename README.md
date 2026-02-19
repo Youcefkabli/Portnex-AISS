@@ -20,6 +20,7 @@ Live AIS vessel positions in a fixed area: **worker** ingests from AISstream and
    - Readiness: `curl http://localhost:8000/health/ready`
    - Stats: `curl http://localhost:8000/api/v1/stats`
    - Live SSE: `curl -N http://localhost:8000/api/v1/live`
+   - Live table page: open `http://localhost:8000/` in your browser
 
 4. Optional smoke script (after stack is up):
    ```bash
@@ -35,6 +36,10 @@ Live AIS vessel positions in a fixed area: **worker** ingests from AISstream and
 | `GET /api/v1/live` | SSE stream of current vessel positions |
 | `GET /api/v1/stats` | Worker stats + zone bbox |
 | `GET /api/v1/positions/recent?minutes=15` | Recent positions (debug) |
+
+## Connection stability (AISstream)
+
+AISstream closes the connection if the client does not read data fast enough. The worker drains the WebSocket into an in-memory queue and processes in a separate task so the connection stays healthy. If you subscribe to a very large area (e.g. the whole world), use a machine with enough CPU; otherwise use a smaller bounding box in `.env` to reduce message volume. The `/api/v1/stats` response includes a `dropped` count if the queue ever fills.
 
 ## Local run (no Docker)
 

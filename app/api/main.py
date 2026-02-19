@@ -6,8 +6,11 @@ FastAPI application for Phase 1 AIS API.
 """
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.api.health import router as health_router
@@ -35,6 +38,16 @@ app = FastAPI(
     description="Phase 1: real-time vessel positions in a fixed area",
     lifespan=lifespan,
 )
+
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
+
+
+@app.get("/", include_in_schema=False)
+async def live_dashboard():
+    """Simple live table dashboard for current API stream."""
+    return FileResponse(WEB_DIR / "index.html")
+
 
 app.include_router(health_router)
 app.include_router(api_router, prefix=settings.API_PREFIX)

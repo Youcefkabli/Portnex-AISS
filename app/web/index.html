@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIS Live Table</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.35rem;
+    }
+    .meta {
+      margin: 0 0 16px;
+      color: #94a3b8;
+      font-size: 0.95rem;
+    }
+    .status {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      margin-left: 8px;
+      background: #1e293b;
+      color: #f8fafc;
+    }
+    .status.connected {
+      background: #14532d;
+      color: #dcfce7;
+    }
+    .status.disconnected {
+      background: #7f1d1d;
+      color: #fee2e2;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #111827;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 900px;
+    }
+    th, td {
+      padding: 10px 12px;
+      border-bottom: 1px solid #1f2937;
+      text-align: left;
+      white-space: nowrap;
+      font-size: 0.92rem;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #1e293b;
+      color: #f8fafc;
+      font-weight: 600;
+    }
+    tr:hover td {
+      background: #0b1220;
+    }
+    .empty {
+      color: #94a3b8;
+      margin-top: 12px;
+      font-size: 0.95rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>AIS Live Positions</h1>
+  <p class="meta">
+    Streaming from <code>/api/v1/live</code>
+    <span id="conn-status" class="status disconnected">Disconnected</span>
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time (UTC)</th>
+          <th>MMSI</th>
+          <th>Latitude</th>
+          <th>Longitude</th>
+          <th>Speed</th>
+          <th>Course</th>
+          <th>Heading</th>
+          <th>Nav Status</th>
+          <th>ROT</th>
+          <th>Msg Type</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <p id="empty" class="empty">Waiting for live data...</p>
+
+  <script>
+    const maxRows = 100;
+    const byMmsi = new Map();
+    const rowsEl = document.getElementById("rows");
+    const emptyEl = document.getElementById("empty");
+    const statusEl = document.getElementById("conn-status");
+
+    const asText = (value) => {
+      if (value === null || value === undefined || value === "") {
+        return "-";
+      }
+      return String(value);
+    };
+
+    const fmtNumber = (value, digits = 5) => {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return "-";
+      }
+      return Number(value).toFixed(digits);
+    };
+
+    const fmtTime = (raw) => {
+      if (!raw) {
+        return "-";
+      }
+      const date = new Date(raw);
+      if (Number.isNaN(date.getTime())) {
+        return asText(raw);
+      }
+      return date.toISOString().replace("T", " ").replace("Z", "");
+    };
+
+    const render = () => {
+      const rows = Array.from(byMmsi.values())
+        .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
+        .slice(0, maxRows);
+
+      rowsEl.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${fmtTime(row.time)}</td>
+          <td>${asText(row.mmsi)}</td>
+          <td>${fmtNumber(row.latitude)}</td>
+          <td>${fmtNumber(row.longitude)}</td>
+          <td>${fmtNumber(row.speed, 2)}</td>
+          <td>${fmtNumber(row.course, 2)}</td>
+          <td>${asText(row.heading)}</td>
+          <td>${asText(row.nav_status)}</td>
+          <td>${fmtNumber(row.rot, 2)}</td>
+          <td>${asText(row.msg_type)}</td>
+        </tr>
+      `).join("");
+
+      emptyEl.style.display = rows.length ? "none" : "block";
+    };
+
+    const setConnected = (connected) => {
+      statusEl.textContent = connected ? "Connected" : "Disconnected";
+      statusEl.classList.toggle("connected", connected);
+      statusEl.classList.toggle("disconnected", !connected);
+    };
+
+    const es = new EventSource("/api/v1/live");
+
+    es.onopen = () => setConnected(true);
+
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data && data.mmsi) {
+          byMmsi.set(String(data.mmsi), data);
+          render();
+        }
+      } catch (_) {
+        // Ignore malformed events and keep stream alive.
+      }
+    };
+
+    es.onerror = () => {
+      setConnected(false);
+    };
+  </script>
+</body>
+</html>

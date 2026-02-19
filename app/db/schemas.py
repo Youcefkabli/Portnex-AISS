@@ -30,5 +30,6 @@ class StatsOut(BaseModel):
     discarded: int = 0
     vessels: int = 0
     errors: int = 0
+    dropped: int = 0
     zone_name: str = ""
     bbox: dict[str, float] = {}

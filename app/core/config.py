@@ -8,12 +8,12 @@ class Settings(BaseSettings):
     AISSTREAM_API_KEY: str = ""
     AISSTREAM_WS_URL: str = "wss://stream.aisstream.io/v0/stream"
 
-    # ── Fixed zone bounding box ───────────────────────────────
-    ZONE_NAME: str = "My Zone"
-    ZONE_LAT_MIN: float =  -90.0    
-    ZONE_LAT_MAX: float =  90.0
-    ZONE_LON_MIN: float = -180.0
-    ZONE_LON_MAX: float = 180.0
+    # ── Fixed zone bounding box (Port of Halifax / Halifax Harbour) ──
+    ZONE_NAME: str = "Port of Halifax"
+    ZONE_LAT_MIN: float = 44.5
+    ZONE_LAT_MAX: float = 44.8
+    ZONE_LON_MIN: float = -63.65
+    ZONE_LON_MAX: float = -63.55
 
     # ── Database ──────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://ais_user:ais_password@localhost:5432/ais_db"

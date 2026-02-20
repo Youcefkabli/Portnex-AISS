@@ -1,11 +1,6 @@
-from app.db.database import AsyncSessionLocal, get_db
-from app.db.models import Base, Position1Sec, Position1Min, Vessel
+from app.db.schemas import StatsOut, VesselOut
 
 __all__ = [
-    "AsyncSessionLocal",
-    "get_db",
-    "Base",
-    "Position1Sec",
-    "Position1Min",
-    "Vessel",
+    "StatsOut",
+    "VesselOut",
 ]

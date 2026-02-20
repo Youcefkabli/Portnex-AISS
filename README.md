@@ -1,6 +1,6 @@
 # AIS Phase 1 — Real-time vessel stream
 
-Live AIS vessel positions in a fixed area: **worker** ingests from AISstream and writes to TimescaleDB + Redis; **API** serves REST and SSE from Redis/DB.
+Live AIS vessel positions in a fixed area: **single process** — API runs in-process AISstream ingestion and fans out via in-memory broadcaster (no Redis, no database). Minimal latency from AIS message to client.
 
 ## AIS integration guide
 
@@ -14,7 +14,7 @@ For implementation/compliance guardrails specific to AISStream, see `skills.md`.
    # Edit .env: set AISSTREAM_API_KEY
    ```
 
-2. Start the stack:
+2. Start the API (ingest runs inside the same container):
    ```bash
    docker compose up -d
    ```
@@ -37,44 +37,41 @@ For implementation/compliance guardrails specific to AISStream, see `skills.md`.
 | Endpoint | Description |
 |----------|-------------|
 | `GET /health/live` | Liveness probe |
-| `GET /health/ready` | Readiness (DB + Redis) |
+| `GET /health/ready` | Readiness (no external deps) |
 | `GET /api/v1/live` | SSE stream of current vessel positions |
 | `GET /api/v1/stats` | Worker stats + zone bbox |
-| `GET /api/v1/positions/recent?minutes=15` | Recent positions (debug) |
-| `GET /api/v1/vessels/{mmsi}` | Static vessel details (name, type, destination, etc.) |
+| `GET /api/v1/vessels/{mmsi}` | Static vessel details from stream cache (name, type, destination, etc.) |
+
+**Note:** `/api/v1/positions/recent` is removed (no database). Vessel data is in-memory only, from the live stream.
 
 ## Connection stability (AISstream)
 
-AISstream closes the connection if the client does not read data fast enough. The worker drains the WebSocket into an in-memory queue and processes in separate publisher/flush workers so the connection stays healthy. If you subscribe to a very large area (e.g. the whole world), use a machine with enough CPU; otherwise use a smaller bounding box in `.env` to reduce message volume.
+AISstream closes the connection if the client does not read data fast enough. The ingest task drains the WebSocket into an in-memory queue and broadcasts positions in-process so the connection stays healthy. If you subscribe to a very large area (e.g. the whole world), use a machine with enough CPU; otherwise use a smaller bounding box in `.env` to reduce message volume.
 
-**Stats and backpressure:** `GET /api/v1/stats` returns worker counters (`received`, `stored`, `dropped`, `errors`) plus optional backpressure signals: `queue_depth_hwm`, `publish_queue_hwm`, `last_flush_count`, `last_flush_duration_ms`, and `sse_dropped` (SSE clients that were too slow). Keep `dropped` and `sse_dropped` near zero under normal load.
-
-**Tuning (optional):** In `.env` you can set `BATCH_SIZE`, `BATCH_TIMEOUT_SEC`, `WORKER_MSG_QUEUE_SIZE`, and `WORKER_PUBLISH_QUEUE_SIZE` to tune throughput and memory; see `.env.example` and `app/core/config.py` defaults.
+**Stats:** `GET /api/v1/stats` returns ingest counters (`received`, `stored`, `dropped`, `errors`), `queue_depth_hwm`, and `sse_dropped` (SSE clients that were too slow). Keep `dropped` and `sse_dropped` near zero under normal load.
 
 ## Local run (no Docker)
 
-- Start Postgres (with TimescaleDB) and Redis, run `init.sql` on the DB.
-- Set `DATABASE_URL` and `REDIS_URL` in `.env`.
-- API: `uvicorn main:app --reload --host 0.0.0.0 --port 8000`
-- Worker: `python -m worker.main`
+- No Postgres or Redis required.
+- Set `AISSTREAM_API_KEY` (and optional zone/LOG_LEVEL) in `.env`.
+- Run: `uvicorn main:app --reload --host 0.0.0.0 --port 8000`
 
-## Validation (resilience and performance)
+Ingest starts automatically with the API.
 
-- **Functional:** After starting the stack, confirm worker connects and `status` in `/api/v1/stats` is `streaming`; positions and vessels should flow to the live SSE and DB.
-- **Backpressure:** Under sustained load, check `queue_depth_hwm` and `publish_queue_hwm` in stats; if they approach queue sizes, consider a smaller bbox or higher resources. Alert if `dropped` or `sse_dropped` grows.
-- **Resilience:** Temporarily stop Redis or DB and verify the worker logs errors and reconnects without crashing; flush/ publish loops use bounded error handling and retries.
-- **Data integrity:** After worker restarts or reconnects, duplicate positions for the same `(time, mmsi)` are avoided via `ON CONFLICT DO NOTHING` and primary keys on `positions_1sec` and `positions_1min` (see `init.sql`).
+## Validation
+
+- **Functional:** After starting, confirm `status` in `/api/v1/stats` is `streaming`; positions and vessels should flow to the live SSE. Vessel details appear as static data is received from AISstream.
+- **Backpressure:** Under sustained load, check `queue_depth_hwm` in stats; if it approaches the internal queue size, consider a smaller bbox or higher resources. Alert if `dropped` or `sse_dropped` grows.
 
 ## Project layout (Phase 1)
 
 ```
 app/
-  core/config.py      # Settings (bbox, DB, Redis, AISstream)
-  db/                 # Models, session, schemas
+  core/config.py      # Settings (bbox, AISstream, API)
+  db/                 # Schemas (API responses); database stubbed
   api/                # FastAPI app, health, router
-  services/           # Redis publish/subscribe
+  services/           # In-memory live broadcaster, ingest state
 worker/
-  main.py             # AISstream ingestion, DB write, Redis publish
+  main.py             # AISstream ingestion (used in-process by API)
 main.py               # uvicorn entrypoint
-init.sql              # TimescaleDB schema (run once)
 ```

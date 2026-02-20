@@ -1,55 +1,49 @@
 """
-Phase 1 AIS API: live stream, stats, optional positions/recent.
+Phase 1 AIS API: live stream, stats, vessels (in-memory; no Redis/DB).
 
-- GET /live       — SSE stream of current vessel positions (from Redis)
-- GET /stats     — basic worker/API counters (from Redis + zone config)
-- GET /positions/recent — last N minutes from 1-sec table (debug)
+- GET /live       — SSE stream of current vessel positions (from in-process broadcaster)
+- GET /stats      — worker stats + zone bbox (from in-memory)
+- GET /vessels/{mmsi} — static vessel details from in-memory cache
 """
 import asyncio
-from datetime import datetime, timezone, timedelta
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.db.database import get_db
-from app.db.models import Vessel
-from app.db.schemas import Position, StatsOut, VesselOut
-from app.services.redis_client import read_stats, subscribe_live
+from app.db.schemas import StatsOut, VesselOut
+from app.services.ingest_state import get_broadcaster, get_stats, get_vessel_cache
 
 router = APIRouter()
-_UTC = timezone.utc
 _sse_dropped_total: int = 0
 
 
 async def _sse_generator() -> AsyncGenerator[str, None]:
     """
-    Subscribe to Redis live channel and yield SSE events.
+    Subscribe to in-memory broadcaster and yield SSE events.
     Heartbeat every 15s if no message.
     """
     queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=1000)
     HEARTBEAT_SEC = 15.0
 
-    async def consume_redis():
+    async def consume_broadcaster():
+        global _sse_dropped_total
         try:
-            async for payload in subscribe_live():
+            broadcaster = get_broadcaster()
+            async for payload in broadcaster.subscribe_async():
                 try:
                     queue.put_nowait(payload)
                 except asyncio.QueueFull:
-                    global _sse_dropped_total
                     _sse_dropped_total += 1
         except asyncio.CancelledError:
             pass
         except Exception:
             pass
         finally:
-            queue.put_nowait(None)  # signal end
+            queue.put_nowait(None)
 
-    task = asyncio.create_task(consume_redis())
+    task = asyncio.create_task(consume_broadcaster())
     try:
         while True:
             try:
@@ -79,8 +73,9 @@ async def live_stream():
         _sse_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
             "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
         },
     )
@@ -88,58 +83,33 @@ async def live_stream():
 
 @router.get("/stats", response_model=StatsOut)
 async def stats():
-    """Worker stats (from Redis) plus zone config and API-side counters."""
-    data = await read_stats()
-    if data is None:
-        data = {
-            "status": "no worker",
-            "received": 0,
-            "stored": 0,
-            "discarded": 0,
-            "vessels": 0,
-            "errors": 0,
-            "dropped": 0,
-        }
+    """Worker stats (in-memory) plus zone config. sse_dropped from broadcaster."""
+    data = get_stats().copy()
+    broadcaster = get_broadcaster()
     data.setdefault("dropped", 0)
-    data["sse_dropped"] = _sse_dropped_total
+    data["sse_dropped"] = _sse_dropped_total + broadcaster.dropped
+    lon_west = min(settings.ZONE_LON_MIN, settings.ZONE_LON_MAX)
+    lon_east = max(settings.ZONE_LON_MIN, settings.ZONE_LON_MAX)
     return StatsOut(
         **data,
         zone_name=settings.ZONE_NAME,
         bbox={
             "lat_min": settings.ZONE_LAT_MIN,
             "lat_max": settings.ZONE_LAT_MAX,
-            "lon_min": settings.ZONE_LON_MIN,
-            "lon_max": settings.ZONE_LON_MAX,
+            "lon_min": lon_west,
+            "lon_max": lon_east,
         },
     )
 
 
-@router.get("/positions/recent", response_model=list[Position], summary="Recent positions (debug)")
-async def recent_positions(
-    minutes: int = Query(15, ge=1, le=1440),
-    mmsi: Optional[int] = Query(None),
-    limit: int = Query(1000, ge=1, le=50_000),
-    db: AsyncSession = Depends(get_db),
-):
-    """Last N minutes from 1-sec table."""
-    since = datetime.now(_UTC) - timedelta(minutes=minutes)
-    if mmsi:
-        sql = "SELECT * FROM positions_1sec WHERE time >= :since AND mmsi = :mmsi ORDER BY time DESC LIMIT :limit"
-        params = {"since": since, "mmsi": mmsi, "limit": limit}
-    else:
-        sql = "SELECT * FROM positions_1sec WHERE time >= :since ORDER BY time DESC LIMIT :limit"
-        params = {"since": since, "limit": limit}
-    rows = (await db.execute(text(sql), params)).mappings().all()
-    return [Position(**dict(r)) for r in rows]
-
-
 @router.get("/vessels/{mmsi}", response_model=VesselOut, summary="Static vessel details by MMSI")
-async def vessel_by_mmsi(
-    mmsi: int,
-    db: AsyncSession = Depends(get_db),
-):
-    """Fetch one vessel static/voyage record by MMSI."""
-    vessel = (await db.execute(select(Vessel).where(Vessel.mmsi == mmsi))).scalar_one_or_none()
+async def vessel_by_mmsi(mmsi: int):
+    """Fetch one vessel static/voyage record from in-memory cache (from stream)."""
+    cache = get_vessel_cache()
+    vessel = cache.get(mmsi)
     if vessel is None:
         raise HTTPException(status_code=404, detail="Vessel not found")
-    return VesselOut.model_validate(vessel)
+    # VesselOut expects first_seen; cache has last_updated only
+    out = dict(vessel)
+    out.setdefault("first_seen", vessel.get("last_updated"))
+    return VesselOut.model_validate(out)

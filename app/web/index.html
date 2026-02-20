@@ -120,6 +120,17 @@
     const emptyEl = document.getElementById("empty");
     const statusEl = document.getElementById("conn-status");
 
+    let zoneBbox = null;
+    const inZone = (lat, lon) => {
+      if (zoneBbox == null) return true;
+      const latMin = zoneBbox.lat_min;
+      const latMax = zoneBbox.lat_max;
+      const lonMin = zoneBbox.lon_min;
+      const lonMax = zoneBbox.lon_max;
+      return Number.isFinite(lat) && Number.isFinite(lon) &&
+        lat >= latMin && lat <= latMax && lon >= lonMin && lon <= lonMax;
+    };
+
     const escapeHtml = (value) => String(value)
       .replaceAll("&", "&amp;")
       .replaceAll("<", "&lt;")
@@ -193,6 +204,15 @@
       statusEl.classList.toggle("disconnected", !connected);
     };
 
+    fetch("/api/v1/stats")
+      .then((r) => r.ok ? r.json() : null)
+      .then((stats) => {
+        if (stats && stats.bbox) {
+          zoneBbox = stats.bbox;
+        }
+      })
+      .catch(() => {});
+
     const es = new EventSource("/api/v1/live");
 
     es.onopen = () => setConnected(true);
@@ -200,7 +220,10 @@
     es.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data && data.mmsi) {
+        if (data && data.mmsi != null) {
+          const lat = Number(data.latitude);
+          const lon = Number(data.longitude);
+          if (!inZone(lat, lon)) return;
           const key = String(data.mmsi);
           byMmsi.set(key, data);
           if (!vesselByMmsi.has(key) && !vesselFetchInFlight.has(key)) {

@@ -1,31 +1,26 @@
 """
-AIS ingestion worker (Phase 1).
+AIS ingestion (in-process).
 
 - Connects to AISstream, parses and filters by bbox.
-- Writes to TimescaleDB (positions_1sec, vessels), runs flush_1min_from_agg periodically.
-- Publishes each position to Redis for live stream; writes stats to Redis.
+- Broadcasts each position in-process (no Redis); updates shared stats and vessel cache.
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import sys
-import time
 
 # Ensure project root is on path when running as worker
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Dict
 
 import websockets
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
-from app.db.database import AsyncSessionLocal
-from app.db.models import Vessel
-from app.services.redis_client import publish_live_position, write_stats
 
 logger = logging.getLogger("ais.worker")
 
@@ -76,7 +71,7 @@ def _ts(raw: str | None) -> datetime:
 
 def _eta_to_text(raw: Any) -> str | None:
     """
-    Normalise AIS ETA payload to DB text.
+    Normalise AIS ETA payload to text.
     AISStream may provide ETA as object: {"Month":..,"Day":..,"Hour":..,"Minute":..}
     """
     if raw is None:
@@ -89,7 +84,6 @@ def _eta_to_text(raw: Any) -> str | None:
         day = int(raw.get("Day", 0) or 0)
         hour = int(raw.get("Hour", 0) or 0)
         minute = int(raw.get("Minute", 0) or 0)
-        # AIS often uses zeroed/unknown ETA fields.
         if month == 0 and day == 0:
             return None
         return f"{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
@@ -117,9 +111,11 @@ def _parse_position(msg: dict[str, Any]) -> dict | None:
         lon = None
     if lat is None or lon is None:
         return None
+    lon_west = min(settings.ZONE_LON_MIN, settings.ZONE_LON_MAX)
+    lon_east = max(settings.ZONE_LON_MIN, settings.ZONE_LON_MAX)
     if not (
         settings.ZONE_LAT_MIN <= lat <= settings.ZONE_LAT_MAX
-        and settings.ZONE_LON_MIN <= lon <= settings.ZONE_LON_MAX
+        and lon_west <= lon <= lon_east
     ):
         return None
     return {
@@ -132,7 +128,6 @@ def _parse_position(msg: dict[str, Any]) -> dict | None:
         "heading": pos.get("TrueHeading"),
         "nav_status": pos.get("NavigationalStatus"),
         "rot": pos.get("RateOfTurn"),
-        # positions_1sec.msg_type is numeric in DB schema; use AIS MessageID.
         "msg_type": pos.get("MessageID"),
     }
 
@@ -167,10 +162,6 @@ def _parse_static(msg: dict[str, Any]) -> dict | None:
 
 
 def _extract_stream_error(raw: str | bytes) -> str | None:
-    """
-    AISStream docs define server-side failures as: {"error": "..."}.
-    Parse and surface these explicitly (e.g., invalid API key/filter type).
-    """
     try:
         msg = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
@@ -184,86 +175,39 @@ def _extract_stream_error(raw: str | bytes) -> str | None:
     return None
 
 
-async def _flush_1sec(batch: list[dict]) -> None:
-    if not batch:
-        return
-    async with AsyncSessionLocal() as s:
-        await s.execute(
-            text("""
-            INSERT INTO positions_1sec
-                (time, mmsi, latitude, longitude, speed, course,
-                 heading, nav_status, rot, msg_type)
-            VALUES
-                (:time, :mmsi, :latitude, :longitude, :speed, :course,
-                 :heading, :nav_status, :rot, :msg_type)
-            ON CONFLICT DO NOTHING
-        """),
-            batch,
-        )
-        await s.commit()
-    logger.debug("1sec flush: %d rows", len(batch))
+def _serialize_position(row: dict[str, Any]) -> str:
+    """JSON-serialise position; datetime -> ISO string."""
+    out = {}
+    for k, v in row.items():
+        if hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return json.dumps(out)
 
 
-async def _flush_vessels(batch: list[dict]) -> None:
-    if not batch:
-        return
-    async with AsyncSessionLocal() as s:
-        stmt = pg_insert(Vessel).values(batch)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["mmsi"],
-            set_={
-                k: getattr(stmt.excluded, k)
-                for k in (
-                    "imo",
-                    "callsign",
-                    "name",
-                    "ship_type",
-                    "ship_type_text",
-                    "dim_to_bow",
-                    "dim_to_stern",
-                    "dim_to_port",
-                    "dim_to_starboard",
-                    "draught",
-                    "destination",
-                    "eta",
-                    "last_updated",
-                )
-            },
-        )
-        await s.execute(stmt)
-        await s.commit()
-
-
-async def _materialise_1min() -> None:
-    async with AsyncSessionLocal() as s:
-        await s.execute(text("SELECT flush_1min_from_agg()"))
-        await s.commit()
+# Default queue size for AIS message backpressure
+WORKER_MSG_QUEUE_SIZE = 50_000
 
 
 class IngestionWorker:
-    def __init__(self):
+    """
+    In-process AIS ingest: AISStream -> parse -> broadcast + update stats/vessel_cache.
+    """
+
+    def __init__(
+        self,
+        *,
+        broadcast_callback: Callable[[str], None],
+        stats: Dict[str, Any],
+        vessel_cache: Dict[int, dict],
+        msg_queue_size: int = WORKER_MSG_QUEUE_SIZE,
+    ):
+        self._broadcast = broadcast_callback
+        self.stats = stats
+        self._vessel_cache = vessel_cache
         self._running = False
-        self._pos_batch: list[dict] = []
-        self._vessel_batch: list[dict] = []
-        self.stats = {
-            "status": "stopped",
-            "received": 0,
-            "stored": 0,
-            "discarded": 0,
-            "vessels": 0,
-            "errors": 0,
-            "dropped": 0,
-            "queue_depth_hwm": 0,
-            "publish_queue_hwm": 0,
-            "last_flush_count": 0,
-            "last_flush_duration_ms": 0,
-        }
-        self._msg_queue: asyncio.Queue[str | bytes | None] = asyncio.Queue(
-            maxsize=settings.WORKER_MSG_QUEUE_SIZE
-        )
-        self._publish_queue: asyncio.Queue[dict | None] = asyncio.Queue(
-            maxsize=settings.WORKER_PUBLISH_QUEUE_SIZE
-        )
+        self._msg_queue: asyncio.Queue[str | bytes | None] = asyncio.Queue(maxsize=msg_queue_size)
         self._tasks: set[asyncio.Task[Any]] = set()
 
     def _spawn(self, coro: Any, name: str) -> asyncio.Task[Any]:
@@ -280,10 +224,6 @@ class IngestionWorker:
             )
             return
         self._running = True
-        self._spawn(self._flush_loop(), "ais-flush")
-        self._spawn(self._publish_loop(), "ais-publish")
-        self._spawn(self._materialise_loop(), "ais-1min")
-        self._spawn(self._stats_loop(), "ais-stats")
         self._spawn(self._connect_loop(), "ais-ws")
         logger.info(
             "AIS worker started — zone: %s [%.4f,%.4f / %.4f,%.4f]",
@@ -296,63 +236,16 @@ class IngestionWorker:
 
     async def stop(self) -> None:
         self._running = False
-        try:
-            self._publish_queue.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
         for t in list(self._tasks):
             t.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self._flush_all()
+        try:
+            self._msg_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            await self._msg_queue.put(None)
         self.stats["status"] = "stopped"
         logger.info("AIS worker stopped")
-
-    async def _flush_loop(self) -> None:
-        while self._running:
-            await asyncio.sleep(settings.BATCH_TIMEOUT_SEC)
-            try:
-                t0 = time.perf_counter()
-                await self._flush_all()
-                self.stats["last_flush_duration_ms"] = round(
-                    (time.perf_counter() - t0) * 1000
-                )
-            except Exception as exc:
-                self.stats["errors"] += 1
-                logger.warning("flush error: %s", exc)
-
-    async def _publish_loop(self) -> None:
-        while self._running:
-            try:
-                row = await asyncio.wait_for(
-                    self._publish_queue.get(), timeout=1.0
-                )
-                if row is None:
-                    return
-                await publish_live_position(row)
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                self.stats["errors"] += 1
-                logger.debug("publish error: %s", exc)
-
-    async def _materialise_loop(self) -> None:
-        while self._running:
-            await asyncio.sleep(60)
-            try:
-                await _materialise_1min()
-            except Exception as exc:
-                logger.warning("1min materialise error: %s", exc)
-
-    async def _stats_loop(self) -> None:
-        while self._running:
-            await asyncio.sleep(5)
-            try:
-                await write_stats(self.stats)
-            except Exception as exc:
-                logger.debug("stats write error: %s", exc)
 
     async def _connect_loop(self) -> None:
         delay = 1
@@ -361,19 +254,18 @@ class IngestionWorker:
                 await self._stream()
                 delay = 1
             except AISStreamSubscriptionError as exc:
-                self.stats["errors"] += 1
+                self.stats["errors"] = self.stats.get("errors", 0) + 1
                 self.stats["status"] = f"stream error ({exc})"
                 logger.error(
                     "AISStream subscription/authentication failed: %s. "
                     "Check AISSTREAM_API_KEY and FilterMessageTypes.",
                     exc,
                 )
-                # Avoid aggressive reconnect loops for invalid credentials.
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                self.stats["errors"] += 1
+                self.stats["errors"] = self.stats.get("errors", 0) + 1
                 self.stats["status"] = f"reconnecting ({exc})"
                 logger.warning("WS error: %s — retry in %ds", exc, delay)
                 await asyncio.sleep(delay)
@@ -405,7 +297,7 @@ class IngestionWorker:
                     try:
                         self._handle(raw)
                     except Exception as exc:
-                        self.stats["errors"] += 1
+                        self.stats["errors"] = self.stats.get("errors", 0) + 1
                         logger.debug("Parse error: %s", exc)
 
             consumer = asyncio.create_task(consume())
@@ -423,19 +315,18 @@ class IngestionWorker:
                             self._msg_queue.qsize(),
                         )
                     except asyncio.QueueFull:
-                        self.stats["dropped"] += 1
+                        self.stats["dropped"] = self.stats.get("dropped", 0) + 1
             finally:
                 try:
                     self._msg_queue.put_nowait(None)
                 except asyncio.QueueFull:
-                    # Ensure consumer can exit even under sustained high load.
                     await self._msg_queue.put(None)
                 await consumer
 
     def _handle(self, raw: str | bytes) -> None:
         msg = json.loads(raw)
         msg_class = msg.get("MessageType", "")
-        self.stats["received"] += 1
+        self.stats["received"] = self.stats.get("received", 0) + 1
         if "Position" in msg_class or msg_class in (
             "PositionReport",
             "StandardClassBPositionReport",
@@ -443,48 +334,47 @@ class IngestionWorker:
         ):
             row = _parse_position(msg)
             if row is None:
-                self.stats["discarded"] += 1
+                self.stats["discarded"] = self.stats.get("discarded", 0) + 1
                 return
-            self._pos_batch.append(row)
-            self.stats["stored"] += 1
-            try:
-                self._publish_queue.put_nowait(row)
-                self.stats["publish_queue_hwm"] = max(
-                    self.stats.get("publish_queue_hwm", 0),
-                    self._publish_queue.qsize(),
-                )
-            except asyncio.QueueFull:
-                self.stats["dropped"] += 1
+            self.stats["stored"] = self.stats.get("stored", 0) + 1
+            payload = _serialize_position(row)
+            self._broadcast(payload)
         elif "Static" in msg_class or msg_class in (
             "ShipStaticData",
         ):
             row = _parse_static(msg)
             if row:
-                self._vessel_batch.append(row)
-                self.stats["vessels"] += 1
-
-    async def _flush_all(self) -> None:
-        n_pos = len(self._pos_batch)
-        n_vessel = len(self._vessel_batch)
-        await self._flush_pos_now()
-        await self._flush_vessels_now()
-        self.stats["last_flush_count"] = n_pos + n_vessel
-
-    async def _flush_pos_now(self) -> None:
-        batch, self._pos_batch = self._pos_batch, []
-        await _flush_1sec(batch)
-
-    async def _flush_vessels_now(self) -> None:
-        batch, self._vessel_batch = self._vessel_batch, []
-        await _flush_vessels(batch)
+                mmsi = row["mmsi"]
+                self._vessel_cache[mmsi] = row
+                self.stats["vessels"] = self.stats.get("vessels", 0) + 1
 
 
-async def run_worker() -> None:
+async def run_worker_standalone() -> None:
+    """Standalone entry (no API): uses no-op broadcast and local stats/cache."""
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    worker = IngestionWorker()
+    stats: Dict[str, Any] = {
+        "status": "stopped",
+        "received": 0,
+        "stored": 0,
+        "discarded": 0,
+        "vessels": 0,
+        "errors": 0,
+        "dropped": 0,
+        "queue_depth_hwm": 0,
+    }
+    vessel_cache: Dict[int, dict] = {}
+
+    def noop_broadcast(_: str) -> None:
+        pass
+
+    worker = IngestionWorker(
+        broadcast_callback=noop_broadcast,
+        stats=stats,
+        vessel_cache=vessel_cache,
+    )
     await worker.start()
     try:
         while True:
@@ -496,7 +386,7 @@ async def run_worker() -> None:
 
 
 def main() -> None:
-    asyncio.run(run_worker())
+    asyncio.run(run_worker_standalone())
 
 
 if __name__ == "__main__":

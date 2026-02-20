@@ -8,40 +8,25 @@ class Settings(BaseSettings):
     AISSTREAM_API_KEY: str = ""
     AISSTREAM_WS_URL: str = "wss://stream.aisstream.io/v0/stream"
 
-    # ── Fixed zone bounding box (Port of Halifax / Halifax Harbour) ──
+    # ── Fixed zone bounding box (Port of Halifax) ──
     ZONE_NAME: str = "Port of Halifax"
-    ZONE_LAT_MIN: float = 44.5
-    ZONE_LAT_MAX: float = 44.8
-    ZONE_LON_MIN: float = -63.65
-    ZONE_LON_MAX: float = -63.55
-
-    # ── Database ──────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql+asyncpg://ais_user:ais_password@localhost:5432/ais_db"
-
-    # ── Redis (live stream fanout) ────────────────────────────
-    REDIS_URL: str = "redis://localhost:6379/0"
-    REDIS_LIVE_CHANNEL: str = "ais:live"
-    REDIS_STATS_KEY: str = "ais:stats"
-
-    # ── Storage windows ───────────────────────────────────────
-    HIGH_FREQ_RETENTION_HOURS: int = 24
-
-    # ── Ingestion tuning ──────────────────────────────────────
-    BATCH_SIZE: int = 50
-    BATCH_TIMEOUT_SEC: float = 1.0
-    WORKER_MSG_QUEUE_SIZE: int = 50_000
-    WORKER_PUBLISH_QUEUE_SIZE: int = 10_000
+    ZONE_LAT_MIN: float = 43.0
+    ZONE_LAT_MAX: float = 47.0
+    ZONE_LON_MIN: float = -65.0
+    ZONE_LON_MAX: float = -61.0
 
     # ── API ───────────────────────────────────────────────────
     API_PREFIX: str = "/api/v1"
     LOG_LEVEL: str = "INFO"
 
     def bounding_box(self) -> list:
-        """AISstream format: [[[lat_min, lon_min], [lat_max, lon_max]]]"""
+        """AISstream format: [[[lat_min, lon_west], [lat_max, lon_east]]] (normalized so west < east)."""
+        lon_west = min(self.ZONE_LON_MIN, self.ZONE_LON_MAX)
+        lon_east = max(self.ZONE_LON_MIN, self.ZONE_LON_MAX)
         return [
             [
-                [self.ZONE_LAT_MIN, self.ZONE_LON_MIN],
-                [self.ZONE_LAT_MAX, self.ZONE_LON_MAX],
+                [self.ZONE_LAT_MIN, lon_west],
+                [self.ZONE_LAT_MAX, lon_east],
             ]
         ]
 

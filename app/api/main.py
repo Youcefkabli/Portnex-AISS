@@ -1,12 +1,13 @@
 """
-FastAPI application for Phase 1 AIS API.
+FastAPI application for Phase 1 AIS API (in-process ingest; no Redis/DB).
 
 - Health: /health/live, /health/ready
-- API: /api/v1/live, /api/v1/stats, /api/v1/positions/recent
+- API: /api/v1/live, /api/v1/stats, /api/v1/vessels/{mmsi}
 """
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, Dict
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -15,7 +16,9 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.api.health import router as health_router
 from app.api.router import router as api_router
-from app.services.redis_client import close_redis
+from app.services.live_broadcast import LiveBroadcaster
+from app.services.ingest_state import set_broadcaster, set_stats, set_vessel_cache
+from worker.main import IngestionWorker
 
 
 def _setup_logging() -> None:
@@ -29,8 +32,34 @@ def _setup_logging() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _setup_logging()
+
+    broadcaster = LiveBroadcaster(queue_maxsize=1000)
+    stats: Dict[str, Any] = {
+        "status": "stopped",
+        "received": 0,
+        "stored": 0,
+        "discarded": 0,
+        "vessels": 0,
+        "errors": 0,
+        "dropped": 0,
+        "queue_depth_hwm": 0,
+    }
+    vessel_cache: Dict[int, dict] = {}
+
+    set_broadcaster(broadcaster)
+    set_stats(stats)
+    set_vessel_cache(vessel_cache)
+
+    worker = IngestionWorker(
+        broadcast_callback=broadcaster.broadcast,
+        stats=stats,
+        vessel_cache=vessel_cache,
+    )
+    await worker.start()
+
     yield
-    await close_redis()
+
+    await worker.stop()
 
 
 app = FastAPI(

@@ -1,30 +1,17 @@
+"""
+Database module stubbed for simplified (no-DB) deployment.
+
+Live path uses in-memory state only. This module exists so app.db imports
+do not break; AsyncSessionLocal and get_db must not be used.
+"""
 from collections.abc import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
-from app.db.models import Base
-
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-)
-
-AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False,
-)
+# Placeholder; not used when DB is disabled
+AsyncSessionLocal = None  # type: ignore[assignment]
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+    """Not available when running without database."""
+    raise RuntimeError("Database is disabled in this deployment")

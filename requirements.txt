@@ -1,9 +1,7 @@
-# Phase 1 AIS API + worker
+# Phase 1 AIS API (in-process ingest; no Redis/DB)
 fastapi>=0.109.0,<1.0
 uvicorn[standard]>=0.27.0,<1.0
 pydantic>=2.5.0,<3.0
 pydantic-settings>=2.1.0,<3.0
 sqlalchemy[asyncio]>=2.0.0,<3.0
-asyncpg>=0.29.0,<0.30
 websockets>=12.0,<14.0
-redis>=5.0.0,<6.0

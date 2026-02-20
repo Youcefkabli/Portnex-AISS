@@ -98,15 +98,56 @@
     const vesselCountEl = document.getElementById("vessel-count");
     const statusEl = document.getElementById("conn-status");
 
+    let zoneBbox = null;
+    let bboxLayer = null;
+    const inZone = (lat, lon) => {
+      if (zoneBbox == null) return true;
+      return Number.isFinite(lat) && Number.isFinite(lon) &&
+        lat >= zoneBbox.lat_min && lat <= zoneBbox.lat_max &&
+        lon >= zoneBbox.lon_min && lon <= zoneBbox.lon_max;
+    };
+
     const map = L.map("map", {
       zoomControl: true,
       minZoom: 2
-    }).setView([20, 0], 3);
+    }).setView([44.65, -63.58], 11);
 
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19,
       attribution: "&copy; OpenStreetMap contributors"
     }).addTo(map);
+
+    const drawBboxLayer = (b) => {
+      if (bboxLayer) {
+        map.removeLayer(bboxLayer);
+        bboxLayer = null;
+      }
+      if (!Number.isFinite(b.lat_min + b.lat_max + b.lon_min + b.lon_max)) return;
+      const southWest = [b.lat_min, b.lon_min];
+      const northEast = [b.lat_max, b.lon_max];
+      bboxLayer = L.rectangle([southWest, northEast], {
+        color: "#38bdf8",
+        weight: 2,
+        fillColor: "#0ea5e9",
+        fillOpacity: 0.08,
+        dashArray: "6, 4"
+      });
+      bboxLayer.addTo(map);
+    };
+
+    fetch("/api/v1/stats")
+      .then((r) => r.ok ? r.json() : null)
+      .then((stats) => {
+        if (stats && stats.bbox) {
+          zoneBbox = stats.bbox;
+          const b = stats.bbox;
+          if (Number.isFinite(b.lat_min + b.lat_max + b.lon_min + b.lon_max)) {
+            map.fitBounds([[b.lat_min, b.lon_min], [b.lat_max, b.lon_max]], { padding: [20, 20], maxZoom: 14 });
+            drawBboxLayer(b);
+          }
+        }
+      })
+      .catch(() => {});
 
     const setConnected = (connected) => {
       statusEl.textContent = connected ? "Connected" : "Disconnected";
@@ -144,6 +185,15 @@
       if (!data.mmsi || !validCoord(lat, lon)) {
         return;
       }
+      if (!inZone(lat, lon)) {
+        const existing = markerByMmsi.get(key);
+        if (existing) {
+          map.removeLayer(existing);
+          markerByMmsi.delete(key);
+          vesselCountEl.textContent = `${markerByMmsi.size} vessels tracked`;
+        }
+        return;
+      }
 
       const existing = markerByMmsi.get(key);
       if (existing) {
@@ -160,7 +210,7 @@
         marker.bindPopup(popupHtml(data));
         marker.addTo(map);
         markerByMmsi.set(key, marker);
-        if (markerByMmsi.size === 1) {
+        if (markerByMmsi.size === 1 && zoneBbox == null) {
           map.setView([lat, lon], 7);
         }
       }

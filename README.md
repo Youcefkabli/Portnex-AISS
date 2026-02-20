@@ -4,7 +4,7 @@ Live AIS vessel positions in a fixed area: **single process** — API runs in-pr
 
 ## AIS integration guide
 
-For implementation/compliance guardrails specific to AISStream, see `skills.md`.
+For implementation/compliance guardrails specific to AISStream, see `.cursor/rules/aisstream-compliance.mdc`.
 
 ## Quick start (Docker)
 
@@ -54,7 +54,7 @@ AISstream closes the connection if the client does not read data fast enough. Th
 
 - No Postgres or Redis required.
 - Set `AISSTREAM_API_KEY` (and optional zone/LOG_LEVEL) in `.env`.
-- Run: `uvicorn main:app --reload --host 0.0.0.0 --port 8000`
+- Run: `uvicorn app.api.main:app --reload --host 0.0.0.0 --port 8000`
 
 Ingest starts automatically with the API.
 
@@ -73,5 +73,5 @@ app/
   services/           # In-memory live broadcaster, ingest state
 worker/
   main.py             # AISstream ingestion (used in-process by API)
-main.py               # uvicorn entrypoint
 ```
+Run with: `uvicorn app.api.main:app --host 0.0.0.0 --port 8000`
